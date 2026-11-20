@@ -685,6 +685,7 @@ class UvcStreamStats {
     required this.staleFrameCount,
     required this.undersizedFrameCount,
     required this.invalidMjpegCount,
+    this.vendorDroppedFrameCount = 0,
     required this.bufferAllocationFailureCount,
     required this.previewSurfaceFailureCount,
     required this.conversionFailureCount,
@@ -707,6 +708,7 @@ class UvcStreamStats {
       staleFrameCount = 0,
       undersizedFrameCount = 0,
       invalidMjpegCount = 0,
+      vendorDroppedFrameCount = 0,
       bufferAllocationFailureCount = 0,
       previewSurfaceFailureCount = 0,
       conversionFailureCount = 0,
@@ -729,6 +731,8 @@ class UvcStreamStats {
       staleFrameCount: json['staleFrameCount'] as int,
       undersizedFrameCount: json['undersizedFrameCount'] as int,
       invalidMjpegCount: json['invalidMjpegCount'] as int,
+      // Only the libuvc backend reports vendor bulk streams.
+      vendorDroppedFrameCount: json['vendorDroppedFrameCount'] as int? ?? 0,
       bufferAllocationFailureCount: json['bufferAllocationFailureCount'] as int,
       previewSurfaceFailureCount: json['previewSurfaceFailureCount'] as int,
       conversionFailureCount: json['conversionFailureCount'] as int,
@@ -771,6 +775,9 @@ class UvcStreamStats {
   /// Number of MJPEG frames rejected as structurally invalid.
   final int invalidMjpegCount;
 
+  /// Number of vendor bulk frames dropped as damaged or of the wrong size.
+  final int vendorDroppedFrameCount;
+
   /// Number of RGB/RGBA buffer allocation or growth failures.
   final int bufferAllocationFailureCount;
 
@@ -811,6 +818,7 @@ class UvcStreamStats {
     'staleFrameCount': staleFrameCount,
     'undersizedFrameCount': undersizedFrameCount,
     'invalidMjpegCount': invalidMjpegCount,
+    'vendorDroppedFrameCount': vendorDroppedFrameCount,
     'bufferAllocationFailureCount': bufferAllocationFailureCount,
     'previewSurfaceFailureCount': previewSurfaceFailureCount,
     'conversionFailureCount': conversionFailureCount,

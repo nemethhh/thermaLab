@@ -54,6 +54,7 @@ typedef struct {
   uint64_t stale_frame_count;
   uint64_t undersized_frame_count;
   uint64_t invalid_mjpeg_count;
+  uint64_t vendor_dropped_frame_count;
   uint64_t buffer_allocation_failure_count;
   uint64_t preview_surface_failure_count;
   uint64_t conversion_failure_count;
@@ -194,6 +195,14 @@ struct uvc_session {
   ANativeWindow *preview_window;
   ffi_uvc_h264_decoder_t h264;
   ffi_uvc_recording_t rec;
+  // Vendor-bulk streaming (UVC_FRAME_FORMAT_VENDOR_BULK): a reader thread
+  // instead of libuvc streaming. The thread exits within one read timeout
+  // of vendor_stop being set.
+  pthread_t vendor_thread;
+  int vendor_bulk;  // the reader thread runs and must be joined
+  _Atomic int vendor_stop;
+  int vendor_stream_width;
+  int vendor_stream_height;
 #endif
   int preview_rotation;  // 0, 90, 180, 270 (clockwise)
   int preview_flip_h;    // mirror left-right
@@ -582,6 +591,23 @@ static void finish_callback_locked(uvc_session_t *s) {
   if (s->callbacks_inflight == 0) {
     pthread_cond_broadcast(&s->callback_cond);
   }
+}
+
+// Stops the vendor-bulk reader or libuvc streaming, whichever runs.
+// Called with usb_mutex held and mutex not held.
+#if defined(__ANDROID__)
+static void vendor_bulk_stop(uvc_session_t *s);
+#endif
+static void stop_streaming(uvc_session_t *s, uvc_device_handle_t *devh_to_stop) {
+#if defined(__ANDROID__)
+  if (s->vendor_bulk) {
+    vendor_bulk_stop(s);
+    return;
+  }
+#else
+  (void)s;
+#endif
+  uvc_stop_streaming(devh_to_stop);
 }
 
 static void wait_for_callbacks_locked(uvc_session_t *s) {
@@ -1684,7 +1710,7 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(uvc_session_t *s, int fd) {
   pthread_mutex_unlock(&s->mutex);
 
   if (should_stop_streaming) {
-    uvc_stop_streaming(devh_to_stop);
+    stop_streaming(s, devh_to_stop);
     pthread_mutex_unlock(&s->usb_mutex);
   }
 
@@ -1758,6 +1784,300 @@ FFI_PLUGIN_EXPORT int uvc_open_fd(uvc_session_t *s, int fd) {
   return UVC_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// Vendor-bulk streaming (Android): ThermalMaster P3/P1 cameras
+// ---------------------------------------------------------------------------
+// These cameras stream over the bulk-in endpoint of streaming interface 1
+// and are started with a vendor request instead of UVC probe/commit (see
+// UVC_FRAME_FORMAT_VENDOR_BULK). The stream is ordinary UVC-over-bulk: a
+// sequence of payloads, each a UVC payload header plus data, each ending
+// with a short packet or at the device's maximum payload size. A P3 frame
+// is one payload of header + width*height*2 bytes, then a header-only
+// payload with EOF set.
+// ---------------------------------------------------------------------------
+#if defined(__ANDROID__)
+
+#define VENDOR_BULK_INTERFACE 1
+#define VENDOR_BULK_ALT_SETTING 1
+#define VENDOR_BULK_ENDPOINT 0x81
+#define VENDOR_BULK_READ_TIMEOUT_MS 200
+// The P3's maximum payload: the first payload after a manual FFC fills
+// exactly 204800 bytes without a short packet. Reads of this size end on
+// payload boundaries. A multiple of every bulk max packet size, so no
+// packet is split across reads.
+#define VENDOR_BULK_MAX_PAYLOAD 204800
+
+#define UVC_HEADER_FID 0x01
+#define UVC_HEADER_EOF 0x02
+#define UVC_HEADER_ERR 0x40
+
+typedef struct {
+  uint8_t *frame;
+  size_t frame_bytes;
+  size_t frame_len;
+  size_t frame_received;  // data bytes seen, including ones not stored
+  int frame_bad;
+  int fid;
+} vendor_bulk_reader_t;
+
+// Delivers one complete frame into the latest-raw slot and wakes the frame
+// listener, like frame_callback does for uncompressed formats minus the RGB
+// conversion.
+static void vendor_deliver_frame(uvc_session_t *s, const uint8_t *data, size_t len) {
+  int64_t sequence;
+  pthread_mutex_lock(&s->mutex);
+  if (!s->previewing || s->stopping_preview || atomic_load(&s->vendor_stop)) {
+    pthread_mutex_unlock(&s->mutex);
+    return;
+  }
+  if (len > s->latest_raw_capacity) {
+    uint8_t *grown = (uint8_t *)realloc(s->latest_raw, len);
+    if (grown == NULL) {
+      s->stats.buffer_allocation_failure_count += 1;
+      pthread_mutex_unlock(&s->mutex);
+      return;
+    }
+    s->latest_raw = grown;
+    s->latest_raw_capacity = len;
+  }
+  memcpy(s->latest_raw, data, len);
+  s->latest_raw_bytes = len;
+  s->latest_raw_format = UVC_FRAME_FORMAT_VENDOR_BULK;
+  s->latest_raw_width = s->vendor_stream_width;
+  s->latest_raw_height = s->vendor_stream_height;
+  s->latest_sequence += 1;
+  sequence = s->latest_sequence;
+  s->latest_raw_sequence = sequence;
+  s->stats.input_frame_count += 1;
+  finish_frame_delivery_locked(s, monotonic_time_ns());
+  pthread_mutex_unlock(&s->mutex);
+  dispatch_frame(s, sequence);
+}
+
+static void vendor_report_error(uvc_session_t *s) {
+  pthread_mutex_lock(&s->mutex);
+  const char *message = stage_error_ring_locked(s);
+  pthread_mutex_unlock(&s->mutex);
+  dispatch_error(s, message);
+}
+
+// Counts a dropped frame and reports the first and every 100th one, so a
+// stream that never yields a frame still explains itself in the log.
+static void vendor_drop_frame(uvc_session_t *s, const vendor_bulk_reader_t *r) {
+  pthread_mutex_lock(&s->mutex);
+  s->stats.input_frame_count += 1;
+  const uint64_t dropped = ++s->stats.vendor_dropped_frame_count;
+  pthread_mutex_unlock(&s->mutex);
+  if (dropped == 1 || dropped % 100 == 0) {
+    set_last_error(
+        s, "vendor bulk: dropped frame with %zu of %zu bytes%s (%" PRIu64 " dropped)",
+        r->frame_received, r->frame_bytes, r->frame_bad ? ", damaged" : "", dropped);
+    vendor_report_error(s);
+  }
+}
+
+// Ends the frame being assembled: delivers it when it is intact and exactly
+// one frame long, drops it otherwise (such as the oversized first frame
+// after a manual FFC).
+static void vendor_end_frame(uvc_session_t *s, vendor_bulk_reader_t *r) {
+  if (r->frame_received == r->frame_bytes && !r->frame_bad) {
+    vendor_deliver_frame(s, r->frame, r->frame_bytes);
+  } else if (r->frame_received > 0 || r->frame_bad) {
+    vendor_drop_frame(s, r);
+  }
+  r->frame_len = 0;
+  r->frame_received = 0;
+  r->frame_bad = 0;
+}
+
+// Handles one payload: header at p[0], FID toggle and EOF delimit frames.
+static void vendor_process_payload(
+    uvc_session_t *s, vendor_bulk_reader_t *r, const uint8_t *p, size_t n) {
+  if (n < 2 || p[0] < 2 || p[0] > n) {
+    // No valid header: the frame in progress cannot be trusted.
+    r->frame_bad = 1;
+    return;
+  }
+  const size_t header_length = p[0];
+  const int info = p[1];
+  const int fid = info & UVC_HEADER_FID;
+  if (r->fid >= 0 && fid != r->fid) {
+    vendor_end_frame(s, r);
+  }
+  r->fid = fid;
+  if (info & UVC_HEADER_ERR) {
+    r->frame_bad = 1;
+  }
+  const size_t data_length = n - header_length;
+  r->frame_received += data_length;
+  if (r->frame_len + data_length > r->frame_bytes) {
+    r->frame_bad = 1;
+  } else if (!r->frame_bad) {
+    memcpy(r->frame + r->frame_len, p + header_length, data_length);
+    r->frame_len += data_length;
+  }
+  if (info & UVC_HEADER_EOF) {
+    vendor_end_frame(s, r);
+  }
+}
+
+// Reader thread. Each read asks for the rest of a maximum-size payload, so
+// a completion ends exactly where the device ended a payload (short packet
+// or full size). A timeout keeps what it read and continues the payload.
+static void *vendor_bulk_thread(void *arg) {
+  uvc_session_t *s = (uvc_session_t *)arg;
+  libusb_device_handle *usb = uvc_get_libusb_handle(s->devh);
+  vendor_bulk_reader_t r = {
+      .frame_bytes =
+          (size_t)s->vendor_stream_width * (size_t)s->vendor_stream_height * 2,
+      .fid = -1,
+  };
+  uint8_t *payload = (uint8_t *)malloc(VENDOR_BULK_MAX_PAYLOAD);
+  r.frame = (uint8_t *)malloc(r.frame_bytes);
+  size_t payload_len = 0;
+
+  if (payload == NULL || r.frame == NULL || usb == NULL) {
+    set_last_error(s, "vendor bulk: out of memory or no device handle");
+    vendor_report_error(s);
+    free(payload);
+    free(r.frame);
+    return NULL;
+  }
+
+  while (!atomic_load(&s->vendor_stop)) {
+    int transferred = 0;
+    const int request = (int)(VENDOR_BULK_MAX_PAYLOAD - payload_len);
+    const int result = libusb_bulk_transfer(
+        usb, VENDOR_BULK_ENDPOINT, payload + payload_len, request,
+        &transferred, VENDOR_BULK_READ_TIMEOUT_MS);
+    if (result == LIBUSB_ERROR_TIMEOUT) {
+      // Partial reads end on packet boundaries; the payload continues.
+      payload_len += (size_t)transferred;
+      if (payload_len == VENDOR_BULK_MAX_PAYLOAD) {
+        vendor_process_payload(s, &r, payload, payload_len);
+        payload_len = 0;
+      }
+      continue;
+    }
+    if (result == LIBUSB_ERROR_OVERFLOW) {
+      // The device sent more than one payload can hold; resync on the next.
+      UVC_LOGW("UVC_NATIVE", "vendor bulk: payload overflow, dropping frame");
+      payload_len = 0;
+      r.frame_bad = 1;
+      continue;
+    }
+    if (result != 0) {
+      if (!atomic_load(&s->vendor_stop)) {
+        set_last_error(s, "vendor bulk read failed: %s", libusb_error_name(result));
+        vendor_report_error(s);
+      }
+      break;
+    }
+    payload_len += (size_t)transferred;
+    if (payload_len > 0) {
+      vendor_process_payload(s, &r, payload, payload_len);
+    }
+    payload_len = 0;
+  }
+
+  free(payload);
+  free(r.frame);
+  return NULL;
+}
+
+// Releases the streaming interface after a failed or finished stream.
+static void vendor_bulk_release(libusb_device_handle *usb) {
+  libusb_set_interface_alt_setting(usb, VENDOR_BULK_INTERFACE, 0);
+  libusb_release_interface(usb, VENDOR_BULK_INTERFACE);
+}
+
+// Brings the vendor stream up like the official app: claim interface 1,
+// alternate setting 1, vendor request 0x40/0xEE. Called with mutex and
+// usb_mutex held.
+static int vendor_bulk_start(uvc_session_t *s, int width, int height) {
+  if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+    set_last_error(s, "vendor bulk: invalid stream size %dx%d", width, height);
+    return UVC_ERROR_INVALID_PARAM;
+  }
+  libusb_device_handle *usb = uvc_get_libusb_handle(s->devh);
+  if (usb == NULL) {
+    set_last_error(s, "vendor bulk: no USB device handle");
+    return UVC_ERROR_NO_DEVICE;
+  }
+  const size_t frame_bytes = (size_t)width * (size_t)height * 2;
+  uint8_t *raw = (uint8_t *)malloc(frame_bytes);
+  if (raw == NULL) {
+    set_last_error(s, "vendor bulk: out of memory");
+    return UVC_ERROR_NO_MEM;
+  }
+
+  // Not supported on Android (no kernel driver access); harmless there.
+  libusb_set_auto_detach_kernel_driver(usb, 1);
+  int r = libusb_claim_interface(usb, VENDOR_BULK_INTERFACE);
+  if (r != 0) {
+    set_last_error(s, "vendor bulk: claim interface failed: %s", libusb_error_name(r));
+    free(raw);
+    return UVC_ERROR_ACCESS;
+  }
+  r = libusb_set_interface_alt_setting(usb, VENDOR_BULK_INTERFACE, VENDOR_BULK_ALT_SETTING);
+  if (r != 0) {
+    set_last_error(s, "vendor bulk: alt setting failed: %s", libusb_error_name(r));
+    libusb_release_interface(usb, VENDOR_BULK_INTERFACE);
+    free(raw);
+    return UVC_ERROR_IO;
+  }
+  r = libusb_control_transfer(usb, 0x40, 0xEE, 0, VENDOR_BULK_INTERFACE, NULL, 0, 1000);
+  if (r < 0) {
+    set_last_error(s, "vendor bulk: start request failed: %s", libusb_error_name(r));
+    vendor_bulk_release(usb);
+    free(raw);
+    return UVC_ERROR_IO;
+  }
+
+  free(s->latest_raw);
+  s->latest_raw = raw;
+  s->latest_raw_capacity = frame_bytes;
+  s->latest_raw_bytes = 0;
+  s->vendor_stream_width = width;
+  s->vendor_stream_height = height;
+  atomic_store(&s->vendor_stop, 0);
+  reset_stream_stats_locked(s);
+  s->stats.start_monotonic_ns = monotonic_time_ns();
+  s->frame_width = width;
+  s->frame_height = height;
+  s->callback_count = 0;
+  s->latest_sequence = 0;
+
+  if (pthread_create(&s->vendor_thread, NULL, vendor_bulk_thread, s) != 0) {
+    set_last_error(s, "vendor bulk: failed to start reader thread");
+    vendor_bulk_release(usb);
+    return UVC_ERROR_IO;
+  }
+  s->vendor_bulk = 1;
+  s->previewing = 1;
+  clear_last_error(s);
+  UVC_LOGI("UVC_NATIVE", "vendor bulk stream started %dx%d", width, height);
+  return UVC_SUCCESS;
+}
+
+// Stops the reader thread and releases the streaming interface. Called
+// with usb_mutex held and mutex not held.
+static void vendor_bulk_stop(uvc_session_t *s) {
+  if (!s->vendor_bulk) {
+    return;
+  }
+  atomic_store(&s->vendor_stop, 1);
+  pthread_join(s->vendor_thread, NULL);
+  libusb_device_handle *usb = s->devh != NULL ? uvc_get_libusb_handle(s->devh) : NULL;
+  if (usb != NULL) {
+    vendor_bulk_release(usb);
+  }
+  s->vendor_bulk = 0;
+  UVC_LOGI("UVC_NATIVE", "vendor bulk stream stopped");
+}
+
+#endif  // __ANDROID__
+
 FFI_PLUGIN_EXPORT int uvc_start_preview(
     uvc_session_t *s,
     int frame_format,
@@ -1775,6 +2095,10 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
   // The AMediaCodec decode path only exists in the Android build.
   if (frame_format == UVC_FRAME_FORMAT_H264) {
     set_last_error(s, "H.264 preview requires the Android backend");
+    return UVC_ERROR_NOT_SUPPORTED;
+  }
+  if (frame_format == UVC_FRAME_FORMAT_VENDOR_BULK) {
+    set_last_error(s, "Vendor bulk preview requires the Android backend");
     return UVC_ERROR_NOT_SUPPORTED;
   }
 #endif
@@ -1796,7 +2120,7 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
   pthread_mutex_unlock(&s->mutex);
 
   if (should_stop_streaming) {
-    uvc_stop_streaming(devh_to_stop);
+    stop_streaming(s, devh_to_stop);
     pthread_mutex_unlock(&s->usb_mutex);
   }
 
@@ -1811,6 +2135,17 @@ FFI_PLUGIN_EXPORT int uvc_start_preview(
     pthread_mutex_unlock(&s->mutex);
     return UVC_ERROR_NO_DEVICE;
   }
+
+#if defined(__ANDROID__)
+  if (frame_format == UVC_FRAME_FORMAT_VENDOR_BULK) {
+    // Vendor bulk streams skip UVC negotiation and the RGB frame entirely.
+    pthread_mutex_lock(&s->usb_mutex);
+    const int vendor_result = vendor_bulk_start(s, width, height);
+    pthread_mutex_unlock(&s->usb_mutex);
+    pthread_mutex_unlock(&s->mutex);
+    return vendor_result;
+  }
+#endif
 
   uvc_stream_ctrl_t ctrl;
   memset(&ctrl, 0, sizeof(ctrl));
@@ -2151,6 +2486,7 @@ FFI_PLUGIN_EXPORT int uvc_get_stream_stats_json(uvc_session_t *s, uint8_t *buffe
           "\"staleFrameCount\":%" PRIu64 ","
           "\"undersizedFrameCount\":%" PRIu64 ","
           "\"invalidMjpegCount\":%" PRIu64 ","
+          "\"vendorDroppedFrameCount\":%" PRIu64 ","
           "\"bufferAllocationFailureCount\":%" PRIu64 ","
           "\"previewSurfaceFailureCount\":%" PRIu64 ","
           "\"conversionFailureCount\":%" PRIu64 ","
@@ -2171,6 +2507,7 @@ FFI_PLUGIN_EXPORT int uvc_get_stream_stats_json(uvc_session_t *s, uint8_t *buffe
           stats.stale_frame_count,
           stats.undersized_frame_count,
           stats.invalid_mjpeg_count,
+          stats.vendor_dropped_frame_count,
           stats.buffer_allocation_failure_count,
           stats.preview_surface_failure_count,
           stats.conversion_failure_count,
@@ -2211,7 +2548,7 @@ FFI_PLUGIN_EXPORT void uvc_stop_preview(uvc_session_t *s) {
 
   if (should_stop_streaming) {
     UVC_LOGD("UVC_NATIVE", "uvc_stop_preview before uvc_stop_streaming");
-    uvc_stop_streaming(devh_to_stop);
+    stop_streaming(s, devh_to_stop);
     UVC_LOGD("UVC_NATIVE", "uvc_stop_preview after uvc_stop_streaming");
     pthread_mutex_unlock(&s->usb_mutex);
   }
@@ -2249,7 +2586,7 @@ FFI_PLUGIN_EXPORT void uvc_close_device(uvc_session_t *s) {
   pthread_mutex_unlock(&s->mutex);
 
   if (should_stop_streaming) {
-    uvc_stop_streaming(devh_to_stop);
+    stop_streaming(s, devh_to_stop);
     pthread_mutex_unlock(&s->usb_mutex);
   }
 

@@ -270,9 +270,13 @@ enum CameraFamily {
   /// InfiRay Tiny1-C modules (P2 Pro, Topdon TC001, ...): a processed image
   /// on top and a second half of temperatures in 1/64 K below.
   tiny1c,
+
+  /// ThermalMaster P3 / P1: a picture, two info rows and a second half of
+  /// temperatures in 1/64 K, streamed over a vendor bulk pipe.
+  p3,
 }
 
-/// Temperatures from cameras that deliver them directly (Tiny1-C) are kept
+/// Temperatures from cameras that deliver them directly (Tiny1-C, P3) are kept
 /// as "counts" on a linear scale, so the rest of the pipeline (statistics,
 /// colouring, markers, logging) works the same for every camera:
 /// count = (°C + [kLinearOffsetC]) * [kLinearCountsPerC], 0.05 °C steps
@@ -298,16 +302,16 @@ class T2sFrame {
 
   final CameraFamily family;
 
-  /// Xtherm sensor constants; null for Tiny1-C frames.
+  /// Xtherm sensor constants; null for other families.
   final SensorProfile? profile;
   final int width;
   final int height;
 
-  /// Sensor counts, row-major, `width * height` entries. For Tiny1-C frames
-  /// these are linear temperature counts (see [linearCountFor]).
+  /// Sensor counts, row-major, `width * height` entries. For Tiny1-C and P3
+  /// frames these are linear temperature counts (see [linearCountFor]).
   final Uint16List counts;
 
-  /// Xtherm metadata rows; null for Tiny1-C frames.
+  /// Xtherm metadata rows; null for other families.
   final T2sMetadata? meta;
 
   /// The full frame exactly as received, for export.
@@ -356,22 +360,61 @@ class T2sFrame {
     int frameHeight,
   ) {
     if (frameHeight.isOdd || frameHeight < 4) return null;
-    final int wordCount = frameWidth * frameHeight;
-    if (payload.lengthInBytes < wordCount * 2) return null;
-    final Uint8List data = Uint8List.fromList(
-      payload.sublist(0, wordCount * 2),
-    );
-    final ByteData bytes = data.buffer.asByteData();
     final int imageHeight = frameHeight ~/ 2;
+    // The upper half is the picture.
+    return _decodeKelvin64(
+      CameraFamily.tiny1c,
+      payload,
+      frameWidth,
+      frameHeight,
+      imageHeight,
+      frameWidth * imageHeight * 2,
+    );
+  }
+
+  /// Decodes a ThermalMaster P3/P1 frame of `frameWidth x frameHeight`
+  /// where `frameHeight == 2·imageHeight + 2`: a picture, two info rows,
+  /// then little-endian temperatures in 1/64 K as for Tiny1-C.
+  static T2sFrame? decodeP3(
+    Uint8List payload,
+    int frameWidth,
+    int frameHeight,
+  ) {
+    if (frameHeight.isOdd || frameHeight < 6) return null;
+    final int imageHeight = frameHeight ~/ 2 - 1;
+    // Skip the picture and the two info rows.
+    return _decodeKelvin64(
+      CameraFamily.p3,
+      payload,
+      frameWidth,
+      frameHeight,
+      imageHeight,
+      frameWidth * (imageHeight + 2) * 2,
+    );
+  }
+
+  /// Converts `frameWidth x imageHeight` temperatures in 1/64 K, starting
+  /// at byte [start], into linear counts.
+  static T2sFrame? _decodeKelvin64(
+    CameraFamily family,
+    Uint8List payload,
+    int frameWidth,
+    int frameHeight,
+    int imageHeight,
+    int start,
+  ) {
+    final int frameBytes = frameWidth * frameHeight * 2;
+    if (payload.lengthInBytes < frameBytes) return null;
+    final Uint8List data = Uint8List.fromList(payload.sublist(0, frameBytes));
+    final ByteData bytes = data.buffer.asByteData();
     final int n = frameWidth * imageHeight;
-    final int start = n * 2; // bytes: the upper half is the picture
     final Uint16List counts = Uint16List(n);
     for (int i = 0; i < n; i++) {
       final int raw = bytes.getUint16(start + i * 2, Endian.little);
       counts[i] = linearCountFor(raw / 64.0 - kZeroCelsius);
     }
     return T2sFrame._(
-      family: CameraFamily.tiny1c,
+      family: family,
       profile: null,
       width: frameWidth,
       height: imageHeight,

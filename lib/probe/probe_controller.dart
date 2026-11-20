@@ -15,6 +15,7 @@ import '../render/palette.dart';
 import '../render/scene_layout.dart';
 import '../t2s/camera_catalog.dart';
 import '../t2s/flat_field.dart';
+import '../t2s/p3_commands.dart';
 import '../t2s/shutter_correction.dart';
 import '../t2s/t2s_commands.dart';
 import '../t2s/t2s_frame.dart';
@@ -219,9 +220,11 @@ class ProbeController extends ChangeNotifier {
 
   late final Tiny1cCommands _tiny1c = Tiny1cCommands(_camera.controlTransfer);
 
+  late final P3Commands _p3 = P3Commands(_camera.controlTransfer);
+
   /// Whether the app can trigger the camera's shutter (Tiny1-C modules
   /// calibrate on their own and offer no known command for it).
-  bool get canTriggerShutter => family == CameraFamily.xtherm;
+  bool get canTriggerShutter => family != CameraFamily.tiny1c;
 
   /// True while a V2 camera streams but has no shutter reference yet: the
   /// image would still show the raw stripes, so it is not shown.
@@ -507,24 +510,42 @@ class ProbeController extends ChangeNotifier {
       for (final UvcCameraMode m in modes) {
         log('Mode: ${m.label} (format ${m.frameFormat})');
       }
-      final StreamChoice? choice = chooseStream(<OfferedMode>[
-        for (int i = 0; i < modes.length; i++)
-          OfferedMode(modes[i].formatName, modes[i].width, modes[i].height, i),
-      ], known);
-      if (choice == null) {
-        status = 'Camera not supported';
-        log('No supported stream layout among the offered modes');
-        return;
+      final (int, int)? bulk = known?.vendorBulkStream;
+      if (bulk != null) {
+        // A stream the UVC stack does not enumerate; started directly.
+        family = known!.family;
+        mode = UvcCameraMode(
+          frameFormat: kVendorBulkFrameFormat,
+          formatName: 'vendor bulk',
+          width: bulk.$1,
+          height: bulk.$2,
+          fps: 25,
+        );
+        log('Protocol ${family.name}: known camera ${known.name}, '
+            'vendor bulk stream');
+      } else {
+        final StreamChoice? choice = chooseStream(<OfferedMode>[
+          for (int i = 0; i < modes.length; i++)
+            OfferedMode(modes[i].formatName, modes[i].width, modes[i].height, i),
+        ], known);
+        if (choice == null) {
+          status = 'Camera not supported';
+          log('No supported stream layout among the offered modes');
+          return;
+        }
+        mode = modes[choice.modeIndex];
+        family = choice.family;
+        log('Protocol ${family.name}: ${choice.reason}');
       }
-      mode = modes[choice.modeIndex];
-      family = choice.family;
-      log('Protocol ${family.name}: ${choice.reason}');
-      if (family == CameraFamily.tiny1c) {
-        // The module corrects itself; nothing to wait for.
+      if (family == CameraFamily.tiny1c || family == CameraFamily.p3) {
+        // The camera corrects itself; nothing to wait for.
         settings = settings.copyWith(revision: HardwareRevision.v1);
         _revisionPending = false;
         _correctionAttempted = true;
-        cameraName = known?.name ?? 'Tiny1-C thermal camera';
+        cameraName = known?.name ??
+            (family == CameraFamily.p3
+                ? 'P3-type thermal camera'
+                : 'Tiny1-C thermal camera');
       } else {
         final HardwareRevision? rev = known?.revision;
         _revisionPending = rev == null;
@@ -553,10 +574,13 @@ class ProbeController extends ChangeNotifier {
       notifyListeners();
 
       await Future<void>.delayed(const Duration(milliseconds: 500));
-      if (family == CameraFamily.xtherm) {
-        sendCommand(T2sCommand.rawMode, 'raw mode');
-      } else {
-        await _setupTiny1c();
+      switch (family) {
+        case CameraFamily.xtherm:
+          sendCommand(T2sCommand.rawMode, 'raw mode');
+        case CameraFamily.tiny1c:
+          await _setupTiny1c();
+        case CameraFamily.p3:
+          await _setupP3();
       }
     } catch (e) {
       status = 'Connect failed';
@@ -620,6 +644,29 @@ class ProbeController extends ChangeNotifier {
     }
   }
 
+  /// Logs device information and takes the measurement range from the
+  /// camera, which keeps its gain setting; nothing is written.
+  Future<void> _setupP3() async {
+    try {
+      log('P3: model "${await _p3.readRegisterString(P3Register.model, 30)}"');
+      log('P3: firmware "${await _p3.readRegisterString(P3Register.firmware, 12)}"');
+      log('P3: serial "${await _p3.readRegisterString(P3Register.serial, 64)}"');
+    } catch (e) {
+      log('P3 device information read failed: $e');
+    }
+    try {
+      final bool high = await _p3.readHighGain();
+      settings = settings.copyWith(
+        range: high ? MeasurementRange.normal : MeasurementRange.high,
+      );
+      log('P3: ${high ? 'high' : 'low'} gain'
+          ' (${high ? '-20..150' : '0..550'} °C)');
+      notifyListeners();
+    } catch (e) {
+      log('P3 gain read failed: $e');
+    }
+  }
+
   Future<void> disconnect({bool keepLog = false}) async {
     _pollTimer?.cancel();
     _pollTimer = null;
@@ -670,7 +717,16 @@ class ProbeController extends ChangeNotifier {
     }
   }
 
-  void triggerShutter() => sendCommand(T2sCommand.shutter, 'shutter');
+  void triggerShutter() {
+    if (family == CameraFamily.p3) {
+      _p3
+          .triggerShutter()
+          .then((_) => log('P3: shutter'))
+          .catchError((Object e) => log('P3 shutter command failed: $e'));
+      return;
+    }
+    sendCommand(T2sCommand.shutter, 'shutter');
+  }
 
   void setRange(MeasurementRange range) {
     if (family == CameraFamily.tiny1c) {
@@ -679,6 +735,12 @@ class ProbeController extends ChangeNotifier {
           .setHighGain(range == MeasurementRange.normal)
           .then((_) => log('Tiny1-C: range ${range.name}'))
           .catchError((Object e) => log('Tiny1-C range command failed: $e'));
+    } else if (family == CameraFamily.p3) {
+      // Same mapping: high gain is the normal range.
+      _p3
+          .setHighGain(range == MeasurementRange.normal)
+          .then((_) => log('P3: range ${range.name}'))
+          .catchError((Object e) => log('P3 range command failed: $e'));
     } else {
       sendCommand(
         range == MeasurementRange.high
@@ -724,7 +786,8 @@ class ProbeController extends ChangeNotifier {
       log('Tiny1-C cameras run their shutter calibration on their own');
       return;
     }
-    if (settings.revision == HardwareRevision.v1) {
+    if (family == CameraFamily.p3 ||
+        settings.revision == HardwareRevision.v1) {
       triggerShutter();
       return;
     }
@@ -1118,9 +1181,12 @@ class ProbeController extends ChangeNotifier {
     lastFrameInfo =
         'format ${raw.frameFormat}, ${raw.width}x${raw.height}, '
         '${raw.bytes.length} bytes, seq ${raw.sequence}';
-    final T2sFrame? decoded = family == CameraFamily.tiny1c
-        ? T2sFrame.decodeTiny1c(raw.bytes, raw.width, raw.height)
-        : T2sFrame.decode(raw.bytes, raw.width, raw.height);
+    final T2sFrame? decoded = switch (family) {
+      CameraFamily.xtherm => T2sFrame.decode(raw.bytes, raw.width, raw.height),
+      CameraFamily.tiny1c =>
+        T2sFrame.decodeTiny1c(raw.bytes, raw.width, raw.height),
+      CameraFamily.p3 => T2sFrame.decodeP3(raw.bytes, raw.width, raw.height),
+    };
     if (decoded == null) {
       undecodableFrames++;
       if (undecodableFrames == 1 || undecodableFrames % 100 == 0) {
@@ -1451,6 +1517,7 @@ class ProbeController extends ChangeNotifier {
           'framesReceived': framesReceived,
           'undecodableFrames': undecodableFrames,
         },
+        'stream': _camera.getStreamStats().toJson(),
         'settings': <String, Object?>{
           'revision': settings.revision.name,
           'range': settings.range.name,

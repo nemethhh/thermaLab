@@ -18,6 +18,14 @@ Trimmed to the plugin itself (no example app, tests or screenshots).
   (raw `libusb_control_transfer` on the open device, Android only) and
   `UvcCamera.controlTransfer()`, for camera commands that are not UVC
   controls (InfiRay Tiny1-C modules such as the P2 Pro).
+- **Vendor bulk streaming.** Frame format `UVC_FRAME_FORMAT_VENDOR_BULK`
+  (100) for cameras whose stream the UVC stack does not enumerate
+  (ThermalMaster P3/P1): `uvc_start_preview` claims streaming interface 1,
+  selects alternate setting 1, sends vendor request `0x40/0xEE` and reads
+  the bulk endpoint on its own thread, reassembling frames from the UVC
+  payload headers. Frames arrive through the raw path only; dropped frames
+  are counted in `vendorDroppedFrameCount` of the stream stats and
+  reported to the error listener. Android only.
 - **Android build:** `compileSdk` 36 and NDK `27.0.12077973` to match the
   locally installed SDK.
 

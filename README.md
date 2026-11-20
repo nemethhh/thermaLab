@@ -5,10 +5,10 @@
 # thermaLab
 
 An Android app for USB-C thermal cameras of the **InfiRay** family, made for
-the **T2S+** and also supporting the **P2 Pro**, **Topdon TC001** and related
-models. It works without the vendor apps. It shows real temperatures, takes
-photos, videos and temperature logs, and streams a live view with remote
-control to any browser in your Wi-Fi.
+the **T2S+** and also supporting the **P2 Pro**, **Topdon TC001**,
+**ThermalMaster P3** and related models. It works without the vendor apps.
+It shows real temperatures, takes photos, videos and temperature logs, and
+streams a live view with remote control to any browser in your Wi-Fi.
 
 <img width="300" alt="image" src="https://github.com/user-attachments/assets/04cb02fd-67e5-496b-9afa-c2e3e9b3a9ab" />
 
@@ -53,6 +53,8 @@ the shape of the video stream it offers.
 | Topdon TC001 (same module and USB ID as the P2 Pro) | `0bda:5830` | Tiny1-C | should work, untested |
 | Other Xtherm cameras: T2S+ V1, T2L, T3S, T3Pro, HT-301 (256, 384 or 640 px wide) | various | Xtherm | detected by stream size, untested |
 | Other Tiny1-C modules (picture and temperatures in one double-height stream) | various | Tiny1-C | detected by stream size, untested |
+| ThermalMaster P3 (256×192) | `3474:45a2` | P3 | should work, untested |
+| ThermalMaster P1 (160×120) | `3474:45c2` | P3 | should work, untested |
 
 Reports from owners of the untested cameras are very welcome: *Settings →
 Diagnostics → Export* produces a file with everything needed.

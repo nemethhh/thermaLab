@@ -119,6 +119,42 @@ void main() {
         isNull,
       );
     });
+
+    test('ThermalMaster P3 and P1 USB IDs are known', () {
+      final KnownCamera p3 = knownCamera('3474:45a2')!;
+      expect(p3.name, 'ThermalMaster P3');
+      expect(p3.family, CameraFamily.p3);
+      final KnownCamera p1 = knownCamera('3474:45c2')!;
+      expect(p1.name, 'ThermalMaster P1');
+      expect(p1.family, CameraFamily.p3);
+    });
+
+    test('vendor-bulk stream sizes by USB ID', () {
+      expect(knownCamera('3474:45a2')!.vendorBulkStream, (256, 386));
+      expect(knownCamera('3474:45c2')!.vendorBulkStream, (160, 242));
+      expect(knownCamera('04b4:0100')!.vendorBulkStream, isNull);
+    });
+
+    test('a 2h+2 stream shape is P3, distinct from Tiny1-C 2h', () {
+      final StreamChoice c = chooseStream(
+        modes(<(String, int, int)>[('YUYV', 256, 386)]),
+        null,
+      )!;
+      expect(c.family, CameraFamily.p3);
+      expect(c.modeIndex, 0);
+      expect(c.reason, contains('256x386'));
+      // 384 stays Tiny1-C, 196 stays Xtherm.
+      expect(
+        chooseStream(modes(<(String, int, int)>[('YUYV', 256, 384)]), null)!
+            .family,
+        CameraFamily.tiny1c,
+      );
+      expect(
+        chooseStream(modes(<(String, int, int)>[('YUYV', 256, 196)]), null)!
+            .family,
+        CameraFamily.xtherm,
+      );
+    });
   });
 
   test('Tiny1-C long command packs like P2Pro-Viewer', () async {

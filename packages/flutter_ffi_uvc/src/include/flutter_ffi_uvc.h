@@ -168,6 +168,14 @@ FFI_PLUGIN_EXPORT void uvc_set_error_listener(
 #define UVC_REQUEST_CLOSE 5
 #define UVC_REQUEST_DESTROY 6
 
+// Frame format for cameras that stream over a vendor bulk pipe instead of
+// a negotiated UVC format (ThermalMaster P3/P1): uvc_start_preview claims
+// streaming interface 1, selects alternate setting 1 and sends vendor
+// request 0x40/0xEE. width and height give the frame in 16-bit words;
+// every delivered raw frame is exactly width * height * 2 bytes, and no
+// RGBA frame is produced. Android backend only.
+#define UVC_FRAME_FORMAT_VENDOR_BULK 100
+
 // Verification policy of a start request. NONE completes when the stream
 // starts. SEQUENCE_ONLY waits for one frame. STABLE_FRAMES waits for
 // consecutive_frames frames with no stream error in between.
